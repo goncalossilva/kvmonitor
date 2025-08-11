@@ -249,12 +249,15 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
   auto& clock = kj::systemCoarseMonotonicClock();
   auto startTime = clock.now();
 
+  // Allocate the packet once outside the loop and free on exit.
+  AVPacket* packet = av_packet_alloc();
+  KJ_DEFER(av_packet_free(&packet));
+
   for (;;) {
-    AVPacket* packet = av_packet_alloc();
-    KJ_DEFER(av_packet_unref(packet));
+    // Read a frame into our reusable packet.
     KJ_AVCALL(av_read_frame(formatCtx, packet));
 
-    // Ignore the packet if it isn't from the video substream.
+    // Ignore the packet if it isn't from the audio substream.
     if (packet->stream_index == stream_index) {
       // Deliver the packet to the codec for decoding.
       KJ_AVCALL(avcodec_send_packet(codecCtx, packet));
@@ -275,6 +278,10 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
         totalSamples += samples.size();
       }
     }
+
+    // Unreference the packet's data buffer so it can be reused in the next
+    // call to av_read_frame(). This does NOT free the packet struct itself.
+    av_packet_unref(packet);
 
     {
       auto dataDuration = totalSamples * 1000 / stream->codecpar->sample_rate * kj::MILLISECONDS;
@@ -418,6 +425,11 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
 
   uint64_t totalSamples = 0;
   uint samplesSinceFlush = 0;
+
+  // Allocate the packet once outside the loop and free on exit.
+  AVPacket* packet = av_packet_alloc();
+  KJ_DEFER(av_packet_free(&packet));
+
   for (uint counter = 0; !state.disconnected; counter++) {
     if (codecId == AV_CODEC_ID_AAC && counter >= 100) {
       // TODO: I'm only returning 1s of audio for AAC for debugging reasons... once it actually
@@ -442,21 +454,24 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
     //   KJ_AVCALL(avcodec_send_frame(codecCtx, nullptr));
 
     for (;;) {
-      // Ask codec to deliver a packet.
-      AVPacket* packet = av_packet_alloc();
-      KJ_DEFER(av_packet_unref(packet));
+      // Ask codec to deliver a packet into our reusable packet struct.
       int result = avcodec_receive_packet(codecCtx, packet);
       if (result == AVERROR(EAGAIN)) {
-        // No more packets available.
+        // No more packets available for this frame.
+        // The packet was not filled, so unref below is not needed.
         break;
       } else if (result == AVERROR_EOF) {
         KJ_AVCALL(av_write_trailer(formatCtx));
         return;
       } else if (result < 0) {
-        KJ_FAIL_ASSERT("avcodec_receive_frame()", result, avError(result));
+        KJ_FAIL_ASSERT("avcodec_receive_packet()", result, avError(result));
       }
 
       KJ_AVCALL(av_write_frame(formatCtx, packet));
+
+      // Unreference the packet's data buffer so it can be reused in the next
+      // call to avcodec_receive_packet().
+      av_packet_unref(packet);
     }
 
     if (samplesSinceFlush > frame->sample_rate / 5) {
