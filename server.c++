@@ -243,6 +243,7 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
   uint64_t totalSamples = 0;
   auto& clock = kj::systemCoarseMonotonicClock();
   auto startTime = clock.now();
+  bool started = false;
 
   // Allocate the packet once outside the loop and free on exit.
   AVPacket* packet = av_packet_alloc();
@@ -270,6 +271,11 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
         auto samples = kj::arrayPtr(reinterpret_cast<float*>(frame->data[0]), frame->nb_samples);
         ringBuffer.write(samples.asBytes());
 
+        if (!started) {
+          startTime = clock.now();
+          started = true;
+        }
+
         totalSamples += samples.size();
       }
     }
@@ -282,10 +288,14 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
       auto dataDuration = totalSamples * TIMESTAMP_SCALE / stream->codecpar->sample_rate * kj::MILLISECONDS;
       auto actualDuration = clock.now() - startTime;
 
-      if (actualDuration + 5 * kj::SECONDS < dataDuration ||
-          dataDuration + 5 * kj::SECONDS < actualDuration) {
-        KJ_FAIL_ASSERT("camera stream time has drifetd from real time",
-            dataDuration, actualDuration);
+      if (started) {
+        // Avoid subtracting durations: if the type underflows, a tiny negative drift can look
+        // like a huge positive drift, triggering a spurious restart.
+        if (actualDuration + 5 * kj::SECONDS < dataDuration ||
+            dataDuration + 5 * kj::SECONDS < actualDuration) {
+          KJ_FAIL_ASSERT("camera stream time has drifted from real time",
+              dataDuration, actualDuration);
+        }
       }
     }
   }
