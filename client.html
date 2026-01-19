@@ -14,6 +14,29 @@
         }
       }
 
+      function supportsLowLatency() {
+        if (typeof MediaSource === "undefined") return false;
+        if (typeof MediaSource.isTypeSupported !== "function") return false;
+        if (!MediaSource.isTypeSupported('audio/webm; codecs="opus"')) return false;
+
+        // The low-latency path relies on streaming fetch with ReadableStream.
+        if (typeof fetch !== "function") return false;
+        if (typeof ReadableStream === "undefined") return false;
+        return true;
+      }
+
+      async function playAuto() {
+        if (supportsLowLatency()) {
+          try {
+            await playLowLatency();
+            return;
+          } catch (err) {
+            console.error(err.stack || err);
+          }
+        }
+        playCompatible();
+      }
+
       function playCompatible() {
         // Play the stream in a way compatible with most browsers (including iOS):
         // - By just directly pointing the <audio> element at it.
@@ -97,6 +120,9 @@
           try {
             // Do a streaming fetch.
             let resp = await fetch("/stream.webm");
+            if (!resp.body || !resp.body.getReader) {
+              throw new Error("Streaming fetch not supported");
+            }
             let reader = resp.body.getReader();
 
             for (;;) {
@@ -172,7 +198,10 @@
               }
             }
           } catch (err) {
-            console.error(err.stack);
+            console.error(err.stack || err);
+            if (err && err.message === "Streaming fetch not supported") {
+              throw err;
+            }
           }
 
           // Wait a second and then reconnect.
@@ -185,9 +214,7 @@
   <body>
     <audio id="stream" controls preload="none"></audio>
 
-    <p><button onclick="playLowLatency()" style="width: 100%; height: 96px; font-size: 200%;">start</button></p>
-
-    <p><button onclick="playCompatible()" style="width: 100%; height: 96px; font-size: 200%;">start (iPhone)</button></p>
+    <p><button onclick="playAuto()" style="width: 100%; height: 96px; font-size: 200%;">start</button></p>
 
     <p id="info"></p>
   </body>
