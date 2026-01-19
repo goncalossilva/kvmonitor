@@ -199,7 +199,7 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
   AVFormatContext* formatCtx = nullptr;
   KJ_AVCALL(avformat_open_input(
       &formatCtx, inputUrl.cStr(), NULL, NULL));
-  KJ_DEFER(avformat_free_context(formatCtx));
+  KJ_DEFER(avformat_close_input(&formatCtx));
 
   // Find the video substream.
   int stream_index = -1;
@@ -239,8 +239,6 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
       stream->codecpar->sample_rate / 50,  // seems to be ignored?
       (AVSampleFormat)stream->codecpar->format, LINESIZE_ALIGNMENT));
   KJ_DEFER(av_freep(&frame->data[0]));
-
-  KJ_DEFER(KJ_AVCALL(av_read_pause(formatCtx)));
 
   uint64_t totalSamples = 0;
   auto& clock = kj::systemCoarseMonotonicClock();
