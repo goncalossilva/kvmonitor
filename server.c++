@@ -24,6 +24,7 @@ extern "C" {
 #include <libavformat/avio.h>
 #include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/dict.h>
 #include <libavutil/samplefmt.h>
 }
 
@@ -198,9 +199,21 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
   // ANNOYING: avformat_open_input() wants to allocate the context for us. We can allocate our
   //   own but avformat_open_input() will FREE it on error, wtf.
   AVFormatContext* formatCtx = nullptr;
+  AVDictionary* options = nullptr;
+  KJ_DEFER(av_dict_free(&options));
+
+  // Ensure we don't block forever if the RTSP server stops responding.
+  // (microseconds)
+  av_dict_set(&options, "timeout", "5000000", 0);
+  av_dict_set(&options, "rw_timeout", "5000000", 0);
+
   KJ_AVCALL(avformat_open_input(
-      &formatCtx, inputUrl.cStr(), NULL, NULL));
+      &formatCtx, inputUrl.cStr(), NULL, &options));
   KJ_DEFER(avformat_close_input(&formatCtx));
+
+  // Fill stream codec parameters (in particular codec_id), which can otherwise be missing on
+  // reconnects / unstable streams.
+  KJ_AVCALL(avformat_find_stream_info(formatCtx, nullptr));
 
   // Find the video substream.
   int stream_index = -1;
@@ -294,8 +307,12 @@ void readStream(kj::StringPtr inputUrl, RingBuffer& ringBuffer) {
         // like a huge positive drift, triggering a spurious restart.
         if (actualDuration + 5 * kj::SECONDS < dataDuration ||
             dataDuration + 5 * kj::SECONDS < actualDuration) {
-          KJ_FAIL_ASSERT("camera stream time has drifted from real time",
-              dataDuration, actualDuration);
+          // Drift can happen due to packet loss, jitter, or clock skew. Resync rather than
+          // restarting the RTSP connection.
+          KJ_LOG(WARNING, "camera stream time has drifted from real time; resyncing",
+              inputUrl, dataDuration, actualDuration);
+          totalSamples = 0;
+          started = false;
         }
       }
     }
@@ -487,7 +504,16 @@ void writeStream(kj::ArrayPtr<RingBuffer> ringBuffers, kj::OutputStream& out,
     }
 
     if (samplesSinceFlush > frame->sample_rate / 5) {
-      state.out.write(state.outputBuffer.asPtr());
+      try {
+        state.out.write(state.outputBuffer.asPtr());
+      } catch (...) {
+        auto e = kj::getCaughtExceptionAsKj();
+        if (e.getType() == kj::Exception::Type::DISCONNECTED) {
+          state.disconnected = true;
+          continue;
+        }
+        kj::throwFatalException(kj::mv(e));
+      }
       state.outputBuffer.resize(0);
       samplesSinceFlush = 0;
     }
@@ -637,7 +663,10 @@ public:
               out.write(headers.asBytes());
               writeStream(ringBuffers, out, filename);
             } catch (...) {
-              KJ_LOG(ERROR, kj::getCaughtExceptionAsKj());
+              auto e = kj::getCaughtExceptionAsKj();
+              if (e.getType() != kj::Exception::Type::DISCONNECTED) {
+                KJ_LOG(ERROR, kj::mv(e));
+              }
             }
           }).detach();
 
